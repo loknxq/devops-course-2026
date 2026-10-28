@@ -66,5 +66,24 @@ else
     echo "  [FAIL] Небезопасные права (файлы o+w или ключ не 600)"; ((FAIL++))
 fi
 
+echo "[5] Контейнеризация"
+# а) Служба docker активна
+check "Служба docker активна" "active" "$(systemctl is-active docker)"
+
+# б) Контейнер СУБД в состоянии healthy
+check "Контейнер СУБД healthy" "healthy" "$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null)"
+
+# в) Порты 5000 и 5432 не прослушиваются ни на одном адресе, кроме 127.0.0.1
+# Ищем в ss -tln строки с портами 5000 и 5432. Если они есть и НЕ начинаются с 127.0.0.1 — это нарушение.
+BAD_PORTS=$(ss -tln | awk '$4 ~ /:5000$|:5432$/ && $4 !~ /^127\.0\.0\.1:/ {print $4}')
+if [[ -z "$BAD_PORTS" ]]; then
+    echo "  [OK]   Порты 5000 и 5432 доступны только на 127.0.0.1"; ((PASS++))
+else
+    echo "  [FAIL] Порты доступны не только на 127.0.0.1: $BAD_PORTS"; ((FAIL++))
+fi
+
+# г) Права файла ~/app/.env равны 600
+check "Права ~/app/.env равны 600" "600" "$(stat -c '%a' ~/app/.env 2>/dev/null)"
+
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
