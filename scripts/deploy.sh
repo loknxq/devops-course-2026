@@ -1,70 +1,62 @@
 #!/usr/bin/env bash
-set -uo pipefail
+# Доставка статического ресурса на devops-vm
+# Использование: scripts/deploy.sh [--dry-run]
 
-PASS=0; FAIL=0
+set -euo pipefail
 
-check() {
-    local desc="$1" expected="$2" actual="$3"
-    if [[ "$actual" == "$expected" ]]; then
-        echo "  [OK]   $desc"; ((PASS++))
-    else
-        echo "  [FAIL] $desc (ожидалось: '$expected', получено: '$actual')"; ((FAIL++))
-    fi
-}
+REMOTE="devops"
+REMOTE_DIR="/var/www/devops-site"
+SITE_URL="https://devops.local"
+CA_CERT="${HOME}/devops.crt"
+LOCAL_DIR="$(git rev-parse --show-toplevel)/site/"
 
-echo "Аудит конфигурации: $(hostname -f), $(date '+%Y-%m-%d %H:%M')"
-
-echo "[1] Служба SSH"
-check "Вход от имени root запрещён" "no" "$(sudo sshd -T | awk '/^permitrootlogin/{print $2}')"
-check "Парольная аутентификация отключена" "no" "$(sudo sshd -T | awk '/^passwordauthentication/{print $2}')"
-
-# TODO 1: проверка, что порт отличен от 22
-CURRENT_PORT=$(sudo sshd -T | awk '/^port/{print $2}')
-if [[ "$CURRENT_PORT" != "22" ]]; then
-    echo "  [OK]   Порт SSH отличен от 22 (текущий: $CURRENT_PORT)"; ((PASS++))
-else
-    echo "  [FAIL] Порт SSH равен 22"; ((FAIL++))
+# 1. Разбор аргумента --dry-run
+DRY_RUN=""
+if [[ "${1:-}" == "--dry-run" ]]; then
+    DRY_RUN="--dry-run"
+elif [[ -n "${1:-}" ]]; then
+    echo "Неизвестный аргумент: $1" >&2
+    exit 1
 fi
 
-# TODO 2: проверка, что MaxAuthTries равен 3
-check "MaxAuthTries равен 3" "3" "$(sudo sshd -T | awk '/^maxauthtries/{print $2}')"
-
-echo "[2] Межсетевой экран"
-check "Межсетевой экран активен" "active" "$(sudo ufw status | awk '/^Status:/{print $2}')"
-
-# TODO 3: проверка политики по умолчанию для входящего трафика
-check "Политика по умолчанию для входящих: deny" "deny" "$(sudo ufw status verbose | grep 'Default:' | awk '{print $2}')"
-
-echo "[3] Учётные записи"
-awk -F: '$3>=1000 && $3<65534 {printf "    %s (uid=%s)\n",$1,$3}' /etc/passwd
-
-echo "[4] Веб-сервер"
-# а) Служба nginx активна
-check "Служба nginx активна" "active" "$(systemctl is-active nginx)"
-
-# б) Конфигурация nginx синтаксически корректна
-if sudo nginx -t > /dev/null 2>&1; then
-    echo "  [OK]   Конфигурация nginx корректна"; ((PASS++))
-else
-    echo "  [FAIL] Ошибка в конфигурации nginx"; ((FAIL++))
+# 2. Проверки по требованиям 4 и 5
+# Проверка наличия главной страницы (требование 4)
+if [[ ! -f "${LOCAL_DIR}/index.html" ]]; then
+    echo "Ошибка: файл site/index.html отсутствует. Доставка отменена." >&2
+    exit 1
 fi
 
-# в) Сертификат истекает не ранее чем через 30 дней
-if sudo openssl x509 -checkend 2592000 -noout -in /etc/ssl/certs/devops.crt > /dev/null 2>&1; then
-    echo "  [OK]   Сертификат действителен более 30 дней"; ((PASS++))
-else
-    echo "  [FAIL] Сертификат истекает менее чем через 30 дней"; ((FAIL++))
+# Проверка на незафиксированные изменения (требование 5)
+# --porcelain выводит пустую строку, если изменений нет (включая добавленные в индекс)
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Ошибка: в репозитории есть незафиксированные изменения. Сначала сделайте коммит." >&2
+    exit 1
 fi
 
-# г) Нет файлов с правами o+w и права ключа 600
-WRITABLE_FILES=$(sudo find /var/www/devops-site -perm -o+w 2>/dev/null)
-KEY_PERMS=$(sudo stat -c '%a' /etc/ssl/private/devops.key 2>/dev/null)
+# 3. Синхронизация каталога
+# Используем -e для запрета интерактивного ввода пароля (требование 9)
+RSYNC_SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
+RSYNC_OPTS=(-avz --delete --chmod=D755,F644 -e "${RSYNC_SSH}")
 
-if [[ -z "$WRITABLE_FILES" && "$KEY_PERMS" == "600" ]]; then
-    echo "  [OK]   Права файлов ресурса и ключа безопасны"; ((PASS++))
-else
-    echo "  [FAIL] Небезопасные права (файлы o+w или ключ не 600)"; ((FAIL++))
+if [[ -n "${DRY_RUN}" ]]; then
+    echo "=== План операций (--dry-run) ==="
+    rsync "${RSYNC_OPTS[@]}" --dry-run "${LOCAL_DIR}" "${REMOTE}:${REMOTE_DIR}/"
+    # 4. При --dry-run — завершение с кодом 0
+    exit 0
 fi
 
-echo "Пройдено: $PASS, не пройдено: $FAIL"
-[[ $FAIL -eq 0 ]] && exit 0 || exit 1
+echo "=== Синхронизация файлов ==="
+rsync "${RSYNC_OPTS[@]}" "${LOCAL_DIR}" "${REMOTE}:${REMOTE_DIR}/"
+
+# 5. Проверка доступности ресурса
+echo "=== Проверка доступности ${SITE_URL} ==="
+# curl -f возвращает ошибку при HTTP-кодах >= 400
+# Проверка сертификата выполняется через --cacert
+if curl -f --cacert "${CA_CERT}" -s -o /dev/null "${SITE_URL}"; then
+    COMMIT_HASH=$(git rev-parse --short HEAD)
+    echo "Успех: ресурс доступен. Доставлен коммит: ${COMMIT_HASH}"
+    exit 0
+else
+    echo "Ошибка: ресурс ${SITE_URL} недоступен или сертификат не прошел проверку." >&2
+    exit 1
+fi
