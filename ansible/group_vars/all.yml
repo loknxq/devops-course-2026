@@ -1,0 +1,6 @@
+---
+app_image: "ghcr.io/loknxq/devops-ci-app"
+app_tag: "de32845cef47f837f6018b3a6b4411f096735ed4"
+app_container_name: "devops-ci-app"
+app_host_port: 5000
+app_internal_port: 5000
